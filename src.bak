@@ -1,0 +1,177 @@
+#include <uapi/linux/ptrace.h>
+#include <linux/irq.h>
+#include <linux/netdevice.h>
+#include <linux/irqdesc.h>
+#include <linux/interrupt.h>
+
+BPF_HASH(last);
+
+/* Receive Descriptor - Advanced */
+union ixgbe_adv_rx_desc {
+    struct {
+        __le64 pkt_addr; /* Packet buffer address */
+        __le64 hdr_addr; /* Header buffer address */
+    } read;
+    struct {
+        struct {
+            union {
+                __le32 data;
+                struct {
+                    __le16 pkt_info; /* RSS, Pkt type */
+                    __le16 hdr_info; /* Splithdr, hdrlen */
+                } hs_rss;
+            } lo_dword;
+            union {
+                __le32 rss; /* RSS Hash */
+                struct {
+                    __le16 ip_id; /* IP id */
+                    __le16 csum; /* Packet Checksum */
+                } csum_ip;
+            } hi_dword;
+        } lower;
+        struct {
+            __le32 status_error; /* ext status/error */
+            __le16 length; /* Packet length */
+            __le16 vlan; /* VLAN tag */
+        } upper;
+    } wb;  /* writeback */
+};
+
+
+
+union ixgbe_adv_tx_desc {
+    struct {
+        __le64 buffer_addr;      /* Address of descriptor's data buf */
+        __le32 cmd_type_len;
+        __le32 olinfo_status;
+    } read;
+    struct {
+        __le64 rsvd;       /* Reserved */
+        __le32 nxtseq_seed;
+        __le32 status;
+    } wb;
+};
+
+struct ixgbe_tx_buffer {
+    union ixgbe_adv_tx_desc *next_to_watch;
+    unsigned long time_stamp;
+    void* skb;
+    unsigned int bytecount;
+    unsigned short gso_segs;
+    __be16 protocol;
+    DEFINE_DMA_UNMAP_ADDR(dma);
+    DEFINE_DMA_UNMAP_LEN(len);
+    u32 tx_flags;
+};
+
+struct ixgbe_ring {
+    struct ixgbe_ring *next;    /* pointer to next ring in q_vector */
+    void *q_vector; /* backpointer to host q_vector */
+    void *netdev;    /* netdev ring belongs to */
+    void *dev;        /* device for DMA mapping */
+    void *desc;            /* descriptor ring memory */
+    union {
+        struct ixgbe_tx_buffer *tx_buffer_info;
+        void *rx_buffer_info;
+    };
+    unsigned long state;
+    u8 __iomem *tail;
+    dma_addr_t dma;            /* phys. address of descriptor ring */
+    unsigned int size;        /* length in bytes */
+
+    u16 count;            /* amount of descriptors */
+
+    u8 queue_index; /* needed for multiqueue queue management */
+    u8 reg_idx;            /* holds the special value that gets
+                     * the hardware register offset
+                     * associated with this ring, which is
+                     * different for DCB and RSS modes
+                     */
+    u16 next_to_use;
+    u16 next_to_clean;
+
+    unsigned long last_rx_timestamp;
+
+    union {
+        u16 next_to_alloc;
+        struct {
+            u8 atr_sample_rate;
+            u8 atr_count;
+        };
+    };
+};
+
+struct ixgbe_ring_container {
+    struct ixgbe_ring *ring;/* pointer to linked list of rings */
+    unsigned int total_bytes;/* total bytes processed this int */
+    unsigned int total_packets;/* total packets processed this int */
+    u16 work_limit;/* total work allowed per interrupt */
+    u8 count;/* total number of rings in vector */
+    u8 itr;/* current ITR setting for ring */
+
+};
+
+struct ixgbe_q_vector {
+    void *adapter;
+    u16 v_idx;        /* index of q_vector within array, also used for
+                 * finding the bit in EICR and friends that
+                 * represents the vector for this ring */
+    u16 itr;        /* Interrupt throttle rate written to EITR */
+    struct ixgbe_ring_container rx, tx;
+};
+
+
+int irq_percpu(struct pt_regs *ctx, struct irq_desc *desc) {
+    if (desc->irq_data.irq >= 58 && desc->irq_data.irq <= 59)
+        bpf_trace_printk("time:%llu num:%d handler:%llx \\n", bpf_ktime_get_ns(), desc->irq_data.irq, desc->action->thread_fn);
+    return 0;
+}
+
+int igb_msi_intr(struct pt_regs *ctx, int irq, void *data) {
+    struct igb_q_vector *q_vector = data;
+    if (irq >= 58 && irq <= 59)
+        bpf_trace_printk("irq:%d %llx %llx \\n", irq, q_vector->rx.ring->size, q_vector->tx.ring);
+    return 0;
+}
+
+int ixgbe_msix_intr2(struct pt_regs *ctx, int irq, void *data) {
+    struct ixgbe_q_vector *q_vector = data;
+    union ixgbe_adv_rx_desc *rx_desc;
+    unsigned int size;
+    rx_desc = (&(((union ixgbe_adv_rx_desc *)((q_vector->rx.ring)->desc))[q_vector->rx.ring->next_to_clean]));
+    size = rx_desc->wb.upper.length;
+
+    struct ixgbe_ring *tx_ring = q_vector->tx.ring;
+    unsigned int i = tx_ring->next_to_clean;
+    struct ixgbe_tx_buffer *tx_buffer;
+    tx_buffer = &tx_ring->tx_buffer_info[i];
+    union ixgbe_adv_tx_desc *eop_desc = tx_buffer->next_to_watch;
+//   bpf_trace_printk("irq:%d %llu \\n", irq, tx_buffer->bytecount);
+    bpf_trace_printk("irq:%d %llx \\n", irq, tx_ring);
+    bpf_trace_printk("irq:%d %u \\n", irq, i);
+    bpf_trace_printk("irq:%d %llx \\n", irq, tx_ring->tx_buffer_info);
+    bpf_trace_printk("irq:%d %llx \\n", irq, tx_buffer);
+    bpf_trace_printk("irq:%d %llx \\n", irq, eop_desc);
+    return 0;
+}
+
+bool ixgbe_clean_tx_irq_probe(struct pt_regs *ctx, struct ixgbe_q_vector *q_vector, struct ixgbe_ring *tx_ring, int napi_budget) {
+    unsigned int i = tx_ring->next_to_clean;
+    struct ixgbe_tx_buffer *tx_buffer;
+    tx_buffer = &tx_ring->tx_buffer_info[i];
+    union ixgbe_adv_tx_desc *eop_desc = tx_buffer->next_to_watch;
+    bpf_trace_printk("clean tx:%llx \\n", eop_desc);
+    return 0;
+}
+
+int ixgbe_poll_probe(struct pt_regs *ctx, struct napi_struct *napi, int budget) {
+    bpf_trace_printk("ixgbe poll %s %d \\n", napi->dev->name, budget);
+    return 0;
+}
+
+int ixgbe_poll_retprobe(struct pt_regs *ctx, struct napi_struct *napi, int budget) {
+    int ret = PT_REGS_RC(ctx);
+    bpf_trace_printk("ixgbe poll %s %d\\n", napi->dev->name, ret);
+    return 0;
+}
+
