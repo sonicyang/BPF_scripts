@@ -13,7 +13,7 @@ class Data(ct.Structure):
 
 def print_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(Data)).contents
-    print("%-18.9f %s" % (event.ts / 1000000000.0, event.rxtx))
+    print("%-18.9f\t%s" % (event.ts , event.rxtx))
 
 def __main__():
 
